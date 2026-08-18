@@ -1,3 +1,4 @@
-PyMuPDF==1.24.10
-python-dotenv==1.0.1
-anthropic==0.34.2
+PyMuPDF==1.28.2
+python-dotenv==1.2.3
+anthropic==0.122.0
+chromadb==1.5.9

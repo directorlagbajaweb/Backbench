@@ -2,5 +2,6 @@ venv/
 __pycache__/
 *.pyc
 .env
+chroma_db/
 test_material/*
 !test_material/.gitkeep

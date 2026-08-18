@@ -12,7 +12,7 @@ which comes later once this path is working end to end.
 import sys
 from pathlib import Path
 
-import fitz  # PyMuPDF
+import pymupdf
 
 
 def extract_text_from_pdf(pdf_path: str) -> list[dict]:
@@ -29,7 +29,7 @@ def extract_text_from_pdf(pdf_path: str) -> list[dict]:
     if not path.exists():
         raise FileNotFoundError(f"Can't find file: {pdf_path}")
 
-    doc = fitz.open(path)
+    doc = pymupdf.open(path)
     pages = []
 
     for page_number, page in enumerate(doc, start=1):

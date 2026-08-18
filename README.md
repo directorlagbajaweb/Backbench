@@ -17,10 +17,15 @@ Everything in Phase 1 runs from the terminal. No frontend yet.
 ## Setup
 
 ```bash
-python -m venv venv
+python3.13 -m venv venv
 source venv/bin/activate       # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+Use Python 3.13 (or 3.12). Chroma's dependency tree is only tested up to 3.13,
+and there's an open report of a native crash on macOS ARM64 under 3.14 — not
+worth debugging a segfault on a learning project. On macOS:
+`brew install python@3.13`.
 
 Add your Anthropic API key:
 
@@ -40,9 +45,43 @@ python ingest.py test_material/your_file.pdf
 This should print out the extracted text so you can sanity-check it before
 moving on to chunking and storage.
 
+## Step 2 — chunk, store, and prove retrieval works
+
+Three scripts, each runnable on its own so you can see where a problem is:
+
+```bash
+python chunk.py test_material/your_file.pdf   # just the splitting
+python store.py test_material/your_file.pdf   # splitting + embedding + one test search
+python main.py  test_material/your_file.pdf   # the whole thing, then ask questions
+```
+
+`main.py` runs ingest → chunk → store, then drops into a loop where you type a
+question and it prints the raw chunks that came back, with page numbers. No
+Claude call yet — the point of this step is to confirm with your own eyes that a
+question retrieves the *right section* before any answering logic exists.
+
+Two things worth knowing on first run:
+
+- **It will look like it hung.** The first search downloads ~83 MB of embedding
+  model to `~/.cache/chroma/`. That's a one-off, and it needs an internet
+  connection — there's no offline fallback.
+- **Chunks are capped at ~175 words**, which is smaller than typical RAG advice.
+  Chroma's default embedding model reads only the first 256 tokens of a document
+  and silently truncates the rest, so bigger chunks would store and print fine
+  while being half-invisible to search.
+
+Re-running on the same PDF is safe and won't duplicate anything. Different PDFs
+accumulate in the same collection, in `./chroma_db` (gitignored).
+
+Watch the `distance` numbers: lower means closer. Try a question your material
+*doesn't* cover — you'll still get three chunks back, because Chroma always
+returns the nearest ones, just with visibly worse distances. That gap is what
+Step 3 will use to say "your notes don't cover that" instead of making something
+up.
+
 ## Roadmap
 
 - [x] Step 1 — `ingest.py`: extract text from a PDF
-- [ ] Step 2 — `chunk.py` + `store.py`: split and store in Chroma
-- [ ] Step 3 — `teach.py`: retrieval + grounded teaching via Claude
-- [ ] Step 4 — `main.py`: terminal chat loop
+- [x] Step 2 — `chunk.py` + `store.py` + `main.py`: split, store, prove retrieval
+- [ ] Step 3 — `teach.py`: grounded teaching via Claude
+- [ ] Step 4 — `main.py`: full chat loop wired to teach.py
