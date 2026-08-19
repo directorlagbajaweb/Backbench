@@ -41,9 +41,12 @@ from google.genai import errors, types
 
 from store import search_chunks
 
-# Free tier, and the most capable of the free Flash models. gemini-2.5-flash is
-# the more conservative choice if this one ever misbehaves.
-MODEL = "gemini-3.7-flash"
+# Free tier. Picked over gemini-3.7-flash on measured reliability: 3.7 is the
+# more capable model but returned 503 "high demand" on a third of calls during
+# testing, while this one answered every time. Switch to gemini-3.7-flash if it's
+# responsive and you want the extra capability. Note gemini-2.5-flash 404s — it
+# isn't served on this API version, despite appearing in the pricing tables.
+MODEL = "gemini-3.5-flash"
 TEMPERATURE = 0.2  # grounded teaching, not creative writing — keep it close to the source
 N_RESULTS = 3
 RULE = "=" * 70
