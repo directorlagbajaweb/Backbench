@@ -52,13 +52,17 @@ Three scripts, each runnable on its own so you can see where a problem is:
 ```bash
 python chunk.py test_material/your_file.pdf   # just the splitting
 python store.py test_material/your_file.pdf   # splitting + embedding + one test search
-python main.py  test_material/your_file.pdf   # the whole thing, then ask questions
+python main.py  test_material/your_file.pdf   # the whole pipeline, then ask questions
 ```
 
-`main.py` runs ingest → chunk → store, then drops into a loop where you type a
-question and it prints the raw chunks that came back, with page numbers. No
-Claude call yet — the point of this step is to confirm with your own eyes that a
-question retrieves the *right section* before any answering logic exists.
+`main.py` runs ingest → chunk → store, then drops into a question loop. It no
+longer prints raw chunk text: since Step 4 wired teaching in, each question gets a
+one-line `sources:` summary — the pages it retrieved and how far each sat from the
+question — followed by a taught answer that cites its own pages.
+
+To read the raw text of what retrieval returned, `python chunk.py <pdf>` prints
+every chunk in a file and `python teach.py "<question>"` prints previews of the
+ones a single question pulls back.
 
 Two things worth knowing on first run:
 
@@ -76,8 +80,9 @@ accumulate in the same collection, in `./chroma_db` (gitignored).
 Watch the `distance` numbers: lower means closer. Try a question your material
 *doesn't* cover — you'll still get three chunks back, because Chroma always
 returns the nearest ones, just with visibly worse distances. That gap is what
-Step 3 will use to say "your notes don't cover that" instead of making something
-up.
+Step 3 builds on to say "your notes don't cover that" instead of making something
+up — though it turned out distance alone isn't a reliable enough signal to gate
+on, which is why Step 3 has the model judge relevance for itself.
 
 ## Step 3 — teach from the retrieved chunks
 
@@ -95,9 +100,9 @@ request handling in `generate_answer()` — the system prompt and everything els
 in the file is provider-agnostic, and `anthropic` stays pinned in
 `requirements.txt` for that.
 
-`teach.py` prints the chunks it retrieved and then the answer Claude taught from
-them, so when an answer looks wrong you can see immediately whether retrieval or
-teaching was at fault.
+`teach.py` prints the chunks it retrieved and then the answer taught from them, so
+when an answer looks wrong you can see immediately whether retrieval or teaching
+was at fault.
 
 The system prompt does three things worth knowing about:
 
@@ -108,16 +113,44 @@ The system prompt does three things worth knowing about:
 - **It judges relevance itself.** Retrieval always returns its closest matches,
   however far off they are, and Step 2 showed distance scores don't separate a
   wrong answer from no answer reliably. So distances are passed in as a hint for
-  Claude to weigh, not used as a filter before it ever sees the chunks.
+  the model to weigh, not used as a filter before it ever sees the chunks.
 - **It catches mistakes.** If a worked example in your material contains a clear
   factual, mathematical, or logical error, it says so and teaches the corrected
   version instead of repeating the error as fact.
 
-Not wired into `main.py` yet — that's Step 4.
+## Step 4 — the terminal chat loop
+
+```bash
+python main.py "test_material/your_file.pdf"
+```
+
+Setup runs once, then you stay in the loop typing questions one after another.
+Each gets a `sources:` line and a taught answer. `quit`, `exit`, `q`, Ctrl-C, and
+Ctrl-D all leave cleanly; a blank line just re-prompts without spending a request.
+
+**It's an ongoing session, not a conversation with memory.** The vector store and
+API client stay warm across questions, so ten questions cost one setup — but each
+answer is generated from its own excerpts with no history. Self-contained
+questions work well; a follow-up like "why?" gets *retrieved* as if asked cold,
+because the search looks for material matching the word "why". Carrying
+conversation history is the next thing to build, and it belongs in `teach.py`.
+
+Errors are split by whether waiting helps. A missing API key ends the loop, since
+every later question would fail the same way. A rate limit or an overloaded model
+prints the message and keeps the session open — retype the question.
+
+Worth knowing on the free tier: **20 requests per day, per model.** The quota is
+counted separately for each model, so when today's allowance is gone, changing
+`MODEL` in `teach.py` buys a fresh one. `gemini-3.6-flash`, `gemini-3.7-flash`,
+and `gemini-3.5-flash` all work; `gemini-2.5-flash` returns 404 despite appearing
+in Google's pricing tables.
 
 ## Roadmap
 
 - [x] Step 1 — `ingest.py`: extract text from a PDF
 - [x] Step 2 — `chunk.py` + `store.py` + `main.py`: split, store, prove retrieval
-- [x] Step 3 — `teach.py`: grounded teaching via Claude
-- [ ] Step 4 — `main.py`: full chat loop wired to teach.py
+- [x] Step 3 — `teach.py`: grounded teaching, with mistake-catching
+- [x] Step 4 — `main.py`: terminal chat loop wired to teach.py
+
+Phase 1 is done — the core is proven end to end. Natural next steps: conversation
+history so follow-up questions work, and OCR so scanned material can be ingested.

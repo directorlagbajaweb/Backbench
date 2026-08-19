@@ -41,12 +41,22 @@ from google.genai import errors, types
 
 from store import search_chunks
 
-# Free tier. Picked over gemini-3.7-flash on measured reliability: 3.7 is the
-# more capable model but returned 503 "high demand" on a third of calls during
-# testing, while this one answered every time. Switch to gemini-3.7-flash if it's
-# responsive and you want the extra capability. Note gemini-2.5-flash 404s — it
-# isn't served on this API version, despite appearing in the pricing tables.
-MODEL = "gemini-3.5-flash"
+# Free tier, which allows 20 requests per day per model. That quota is easy to
+# exhaust while testing, and it's counted separately for each model — so this is
+# the knob to turn when today's allowance runs out.
+#
+# Chosen on measured reliability rather than capability. Over four calls each,
+# this one answered 3 times while gemini-3.7-flash managed 1, the rest failing
+# with 503 "high demand" — 3.7 is the more capable model and worth switching to
+# when it's responsive, but it was heavily overloaded when this was measured.
+# gemini-3.5-flash was reliable too, so it's the other fallback.
+#
+# A 503 isn't fatal: main.py's loop prints it and keeps the session open, so
+# retyping the question is usually enough.
+#
+# Note gemini-2.5-flash 404s — it isn't served on this API version, despite
+# appearing in Google's pricing tables.
+MODEL = "gemini-3.6-flash"
 TEMPERATURE = 0.2  # grounded teaching, not creative writing — keep it close to the source
 N_RESULTS = 3
 RULE = "=" * 70
@@ -305,8 +315,14 @@ def main():
         sys.exit(1)
     except errors.ClientError as error:
         if error.code == 429:
-            print("Rate limited — the free tier allows only a few requests per")
-            print("minute. Wait a moment and try again.")
+            # Two different limits both arrive as a 429: a short per-minute rate
+            # limit, and the free tier's 20-requests-per-day-per-model quota. The
+            # API's own message says which one was hit and how long to wait, so
+            # pass it straight through rather than guessing at it.
+            print(f"Rate limited: {error.message}")
+            print("The free tier allows 20 requests per day per model, counted")
+            print(f"separately for each — so changing MODEL (currently {MODEL})")
+            print("buys a fresh allowance when today's is spent.")
         elif error.code in (400, 403):
             print(f"Gemini rejected the request ({error.code}): {error.message}")
             print("If that mentions the API key, check GEMINI_API_KEY in .env.")

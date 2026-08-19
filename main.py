@@ -1,17 +1,25 @@
 """
-Step 2 of Backbench's RAG core: ask questions and watch what comes back.
+Step 4 of Backbench's RAG core: the terminal chat loop.
 
 Usage:
     python main.py test_material/your_file.pdf
 
-This wires ingest -> chunk -> store together, then drops into a question loop
-that prints the raw retrieved chunks, page numbers and all.
+Setup runs once — ingest, chunk, store — and then you stay in a question loop,
+typing one question after another. Each is retrieved from the stored material and
+handed to teach.py, which teaches from those excerpts and only those.
 
-There is no Claude call and no teaching here, on purpose. The only claim being
-tested is that a question pulls back the right section of the material — and if
-retrieval is wrong, no amount of clever prompting downstream will save it.
-Better to see the raw chunks now and trust them later. Grounded answers and
-mistake-catching come next, in teach.py.
+Worth being precise about what this loop is. Setup happens once per run, and the
+vector store and the API client both stay warm across questions, so asking ten
+questions costs one setup instead of ten. But each answer is generated
+independently: generate_answer() takes a question and its own excerpts and no
+history at all. Self-contained questions work well; a follow-up that leans on the
+previous answer ("why?", "explain that further") gets retrieved and answered as
+though it were asked cold, because that's literally what happens. Carrying
+conversation history is the next step, and it belongs in teach.py.
+
+Retrieved chunks are no longer dumped in full — see format_sources() for why. To
+inspect raw text, `python chunk.py <pdf>` prints every chunk in a file and
+`python teach.py "<question>"` prints previews of the ones a question pulls back.
 """
 
 import sys
@@ -19,6 +27,7 @@ import sys
 from chunk import chunk_pages, slugify_source
 from ingest import extract_text_from_pdf
 from store import search_chunks, store_chunks
+from teach import generate_answer
 
 N_RESULTS = 3
 EXIT_WORDS = {"quit", "exit", "q"}
@@ -26,47 +35,44 @@ PROMPT = "\nAsk a question (or 'quit'): "
 RULE = "=" * 70
 
 
-def print_results(question: str, results: list[dict]) -> None:
+def format_sources(results: list[dict]) -> str:
     """
-    Print retrieved chunks in full, one block per result.
+    Summarise where an answer's material came from, in one line.
 
-    Chunk text is shown whole rather than previewed. This is the one place
-    Backbench deliberately breaks from ingest.py's 200-character previews: the
-    question there was "did any text come out?", but here it's "does this chunk
-    contain the answer?" — and 200 characters is about 35 words of a 175-word
-    chunk. A chunk whose relevant sentence sits in the middle would look like a
-    miss while being a perfect hit, and you'd end up retuning the chunker to fix
-    a bug that only ever existed in the printing.
+    Returns a string like:
+        sources: page 1 (0.292), page 5 (0.458), page 5 (0.459)
+
+    Step 2 printed the full text of every retrieved chunk here, because proving
+    retrieval was then the whole point. Now that answers are grounded and cite
+    their own pages, three chunks of raw prose ahead of every reply would bury the
+    answer and make a back-and-forth unreadable. Dropping provenance entirely
+    would be worse though — without it you can't tell a wrong answer caused by bad
+    retrieval from one caused by bad teaching, which is the first thing you need
+    to know. So the pages and distances stay, on one line.
     """
-    if not results:
-        print("\nNothing came back. Is anything actually stored?")
-        return
+    parts = []
 
-    print(f"\nTop {len(results)} chunk(s) for: {question}")
-    print("(distance = how far a chunk sits from your question — lower is closer)")
-
-    for rank, result in enumerate(results, start=1):
-        header = f"[{rank}] page {result.get('page', '?')}   {result.get('chunk_id', 'unknown-id')}"
+    for result in results:
+        part = f"page {result.get('page', '?')}"
         distance = result.get("distance")
         if distance is not None:
-            header += f"   distance {distance:.3f}"
+            part += f" ({distance:.3f})"
+        parts.append(part)
 
-        print(f"\n{RULE}")
-        print(header)
-        print(RULE)
-        print(result.get("text", "").strip())
-
-    print(f"\n{RULE}")
+    return "sources: " + ", ".join(parts)
 
 
 def run_question_loop() -> None:
     """
-    Prompt for questions until the user stops, printing what retrieval returns.
+    Prompt for questions until the user stops, teaching an answer to each.
 
     Quits on "quit", "exit", "q", Ctrl-C or Ctrl-D. Blank input just prompts
     again — a stray Enter shouldn't throw away the file we just read, chunked and
-    embedded. The whole loop sits inside one try, so Ctrl-C during a slow first
-    embedding call is graceful too.
+    embedded, and now also shouldn't cost an API call.
+
+    Errors are split by whether waiting helps. A missing API key fails every
+    question identically, so there's no point sitting in the loop; a rate limit or
+    a server blip is worth staying open for, since the setup cost is already paid.
     """
     try:
         while True:
@@ -75,7 +81,38 @@ def run_question_loop() -> None:
                 continue
             if question.lower() in EXIT_WORDS:
                 break
-            print_results(question, search_chunks(question, n_results=N_RESULTS))
+
+            results = search_chunks(question, n_results=N_RESULTS)
+            if not results:
+                print("\nNothing came back. Is anything actually stored?")
+                continue
+
+            print(f"\n{format_sources(results)}")
+            print(RULE)
+
+            try:
+                print(generate_answer(question, results))
+            except RuntimeError as error:
+                # Configuration, not weather — a missing key won't fix itself.
+                print(error)
+                break
+            except Exception as error:
+                # Broad on purpose, and provider-agnostic on purpose: main.py
+                # never imports the API SDK, so swapping teach.py between Gemini
+                # and Claude needs no change here. Ctrl-C still escapes, because
+                # KeyboardInterrupt is a BaseException and isn't caught by this.
+                #
+                # Read .message and .code by duck-typing rather than importing the
+                # provider's exception classes. Both SDKs expose them, and plain
+                # str() on a Gemini APIError stringifies the entire JSON payload —
+                # several hundred characters of quota metadata in the middle of a
+                # conversation.
+                detail = getattr(error, "message", None) or str(error)
+                code = getattr(error, "code", None)
+                print(f"That question didn't get an answer"
+                      f"{f' ({code})' if code else ''}: {detail}")
+
+            print(RULE)
     except (KeyboardInterrupt, EOFError):
         print()  # step off the half-typed prompt line
 
