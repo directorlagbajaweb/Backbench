@@ -27,7 +27,7 @@ and there's an open report of a native crash on macOS ARM64 under 3.14 — not
 worth debugging a segfault on a learning project. On macOS:
 `brew install python@3.13`.
 
-Add your Anthropic API key:
+Add your API key (Step 3 onwards needs it):
 
 ```bash
 cp .env.example .env
@@ -79,9 +79,45 @@ returns the nearest ones, just with visibly worse distances. That gap is what
 Step 3 will use to say "your notes don't cover that" instead of making something
 up.
 
+## Step 3 — teach from the retrieved chunks
+
+This is the first step that needs an API key. `teach.py` currently calls
+Google's Gemini API, whose free tier works without billing set up:
+
+```bash
+cp .env.example .env    # then paste your Gemini key in as GEMINI_API_KEY
+python teach.py "what research design did the study use?"
+```
+
+Free keys come from [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
+Switching back to Claude later means editing `MODEL`, `get_client()`, and the
+request handling in `generate_answer()` — the system prompt and everything else
+in the file is provider-agnostic, and `anthropic` stays pinned in
+`requirements.txt` for that.
+
+`teach.py` prints the chunks it retrieved and then the answer Claude taught from
+them, so when an answer looks wrong you can see immediately whether retrieval or
+teaching was at fault.
+
+The system prompt does three things worth knowing about:
+
+- **It only teaches from the retrieved chunks**, and says "your material doesn't
+  cover this" rather than filling gaps from general knowledge — even when it
+  knows the answer. Otherwise you can't tell which half of an answer came from
+  your course.
+- **It judges relevance itself.** Retrieval always returns its closest matches,
+  however far off they are, and Step 2 showed distance scores don't separate a
+  wrong answer from no answer reliably. So distances are passed in as a hint for
+  Claude to weigh, not used as a filter before it ever sees the chunks.
+- **It catches mistakes.** If a worked example in your material contains a clear
+  factual, mathematical, or logical error, it says so and teaches the corrected
+  version instead of repeating the error as fact.
+
+Not wired into `main.py` yet — that's Step 4.
+
 ## Roadmap
 
 - [x] Step 1 — `ingest.py`: extract text from a PDF
 - [x] Step 2 — `chunk.py` + `store.py` + `main.py`: split, store, prove retrieval
-- [ ] Step 3 — `teach.py`: grounded teaching via Claude
+- [x] Step 3 — `teach.py`: grounded teaching via Claude
 - [ ] Step 4 — `main.py`: full chat loop wired to teach.py

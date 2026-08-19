@@ -1,4 +1,9 @@
 PyMuPDF==1.28.2
 python-dotenv==1.2.3
-anthropic==0.122.0
 chromadb==1.5.9
+
+# Teaching step. Gemini is what teach.py currently calls (free tier, no billing
+# needed); anthropic is kept pinned so switching back to Claude is just an edit
+# to teach.py rather than a dependency change.
+google-genai==2.18.1
+anthropic==0.122.0
