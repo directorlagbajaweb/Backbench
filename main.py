@@ -26,6 +26,7 @@ import sys
 
 from chunk import chunk_pages, slugify_source
 from ingest import extract_text_from_pdf
+from speak import speak
 from store import search_chunks, store_chunks
 from teach import generate_answer
 
@@ -91,10 +92,11 @@ def run_question_loop() -> None:
             print(RULE)
 
             try:
-                print(generate_answer(question, results))
+                answer = generate_answer(question, results)
             except RuntimeError as error:
                 # Configuration, not weather — a missing key won't fix itself.
                 print(error)
+                print(RULE)
                 break
             except Exception as error:
                 # Broad on purpose, and provider-agnostic on purpose: main.py
@@ -111,8 +113,17 @@ def run_question_loop() -> None:
                 code = getattr(error, "code", None)
                 print(f"That question didn't get an answer"
                       f"{f' ({code})' if code else ''}: {detail}")
+                print(RULE)
+                continue
 
+            print(answer)
             print(RULE)
+
+            # Printing comes first and speaking second, so the answer is on
+            # screen whatever happens to the audio. speak() swallows its own
+            # failures for the same reason — voice is additive here, never a
+            # dependency of the loop.
+            speak(answer)
     except (KeyboardInterrupt, EOFError):
         print()  # step off the half-typed prompt line
 
