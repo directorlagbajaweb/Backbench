@@ -30,12 +30,17 @@ it, so it should not be reachable from the network.
 """
 
 import json
+import os
 import sys
+import tempfile
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from chunk import chunk_pages, slugify_source
 from ingest import extract_text_from_pdf
+from listen import transcribe
+from speak import speak
 from store import get_collection, search_chunks, store_chunks
 from teach import generate_answer
 
@@ -44,6 +49,31 @@ PORT = 8000
 N_RESULTS = 3
 BOARD_PATH = Path(__file__).resolve().parent / "board.html"
 MAX_QUESTION_CHARS = 2000
+MAX_AUDIO_BYTES = 25 * 1024 * 1024
+
+# One thing speaks at a time. The board only asks for speech once its own writing
+# animation has finished, and starting a new question abandons that animation, so
+# two answers rarely contend — but if they do, the newer one waits rather than
+# talking over the older one, and anything superseded while it waited is dropped.
+#
+# Two locks, deliberately. _speaking is held for the whole utterance, which can be
+# twenty seconds; _counter only ever guards an integer. Sharing one lock would
+# make a new request block behind the speech already playing, and that request is
+# an HTTP handler.
+_speaking_lock = threading.Lock()
+_counter_lock = threading.Lock()
+_speak_generation = 0
+
+# Browser audio arrives as opus-in-webm (Chrome, Firefox) or aac-in-mp4 (Safari).
+# The suffix is only a hint — PyAV, already present as a faster-whisper
+# dependency, sniffs the container itself.
+AUDIO_SUFFIXES = {
+    "audio/webm": ".webm",
+    "audio/ogg": ".ogg",
+    "audio/mp4": ".mp4",
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+}
 
 
 def answer_question(question: str) -> dict:
@@ -88,6 +118,82 @@ def answer_question(question: str) -> dict:
     }
 
 
+def speak_in_background(text: str) -> None:
+    """
+    Say text aloud without making the browser wait for it.
+
+    speak() blocks for as long as the speech lasts — twenty seconds is normal for
+    a taught answer — so calling it inside a request handler would hold the
+    connection open that whole time. This hands it to a daemon thread and returns
+    at once.
+
+    The audio comes out of the machine running this server. That's the right
+    behaviour here precisely because the board is bound to 127.0.0.1: the browser
+    and the speakers are the same computer.
+    """
+    global _speak_generation
+
+    with _counter_lock:
+        _speak_generation += 1
+        mine = _speak_generation
+
+    def run() -> None:
+        # Wait for any speech already playing, and only then decide whether this
+        # one is still worth saying. Checking before the wait would be useless:
+        # what makes an utterance stale is another arriving while it queues.
+        with _speaking_lock:
+            with _counter_lock:
+                if mine != _speak_generation:
+                    return
+
+            # speak() does the markdown stripping and the maths-into-words work,
+            # so the board sends the raw answer and this stays the only place
+            # that knows how an answer should be read aloud. Called while holding
+            # _speaking_lock, so two answers can never overlap.
+            speak(text)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def transcribe_upload(audio: bytes, content_type: str) -> dict:
+    """
+    Turn an uploaded recording into text.
+
+    Returns {"text": "..."} or {"error": "..."}.
+
+    Reuses listen.transcribe() exactly as the terminal uses it — same model, same
+    settings. Only the recording half differs: listen.record_until_enter() waits
+    on Enter from the server's own stdin, which no browser can provide, so the
+    page records with MediaRecorder and posts the result here instead.
+    """
+    suffix = AUDIO_SUFFIXES.get(content_type.split(";")[0].strip(), ".bin")
+    path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as handle:
+            handle.write(audio)
+            path = handle.name
+
+        text = transcribe(path)
+        if not text:
+            return {"error": "No speech found in that recording."}
+        return {"text": text}
+
+    except Exception as error:
+        # The detail goes to the server log, not the page: decoder errors quote
+        # the temp file path, and there's no reason to show a browser a path
+        # inside /var/folders.
+        print(f"  transcription failed: {type(error).__name__}: {error}")
+        return {"error": "That recording couldn't be read as audio. "
+                         "Try again, or type the question."}
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
 class BoardHandler(BaseHTTPRequestHandler):
     """Serves the board page and answers one question at a time."""
 
@@ -118,7 +224,27 @@ class BoardHandler(BaseHTTPRequestHandler):
 
         self.send_error(404, "Not found")
 
+    def read_body(self, limit: int) -> bytes | None:
+        """Read the request body, or None if the length is missing or too big."""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return None
+
+        if length <= 0 or length > limit:
+            return None
+
+        return self.rfile.read(length)
+
     def do_POST(self) -> None:
+        if self.path == "/listen":
+            self.handle_listen()
+            return
+
+        if self.path == "/speak":
+            self.handle_speak()
+            return
+
         if self.path != "/ask":
             self.send_error(404, "Not found")
             return
@@ -147,6 +273,34 @@ class BoardHandler(BaseHTTPRequestHandler):
 
         print(f"  asked: {question}")
         self.send_json(answer_question(question[:MAX_QUESTION_CHARS]))
+
+    def handle_listen(self) -> None:
+        """Transcribe an uploaded recording from the browser's microphone."""
+        audio = self.read_body(MAX_AUDIO_BYTES)
+        if not audio:
+            self.send_json({"error": "No audio received."}, status=400)
+            return
+
+        result = transcribe_upload(audio, self.headers.get("Content-Type", ""))
+        print(f"  heard: {result.get('text', result.get('error'))}")
+        self.send_json(result)
+
+    def handle_speak(self) -> None:
+        """Read an answer aloud, once the board has finished writing it."""
+        body = self.read_body(MAX_QUESTION_CHARS * 20)
+        if not body:
+            self.send_json({"error": "Nothing to speak."}, status=400)
+            return
+
+        try:
+            text = str(json.loads(body.decode("utf-8"))["text"])
+        except (ValueError, KeyError, TypeError, UnicodeDecodeError):
+            self.send_json({"error": "Expected JSON with a 'text' field."},
+                           status=400)
+            return
+
+        speak_in_background(text)
+        self.send_json({"speaking": True}, status=202)
 
     def log_message(self, format: str, *args) -> None:
         """Quieten the default per-request logging; do_POST prints what matters."""

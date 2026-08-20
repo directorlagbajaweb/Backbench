@@ -55,7 +55,30 @@
     cursor: pointer;
   }
   button:disabled { opacity: .5; cursor: default; }
+  button.ghost {
+    color: var(--chalk);
+    background: transparent;
+    border: 1px solid var(--frame);
+  }
+  button.ghost.recording {
+    color: #06100e;
+    background: #ff8a7a;
+    border-color: #ff8a7a;
+    animation: pulse 1.1s ease-in-out infinite;
+  }
+  @keyframes pulse { 50% { opacity: .6; } }
+  #voiceRow {
+    display: flex; align-items: center; gap: 8px;
+    margin: -6px 0 14px; color: var(--chalk-dim); font-size: .85rem;
+    cursor: pointer; user-select: none;
+  }
   #status { min-height: 1.4em; margin-bottom: 10px; color: var(--chalk-dim); font-size: .9rem; }
+  #heard:not(:empty) {
+    margin-bottom: 10px; padding: 8px 12px;
+    border-left: 3px solid var(--accent);
+    background: #101a19; border-radius: 0 6px 6px 0;
+    color: var(--chalk); font-size: .9rem; font-style: italic;
+  }
   #sources { margin-bottom: 10px; color: var(--chalk-dim); font-size: .82rem; font-variant-numeric: tabular-nums; }
   #board {
     background: var(--board);
@@ -91,10 +114,17 @@
   <form id="ask">
     <input id="question" type="text" autocomplete="off" autofocus
            placeholder="Ask a question about your material…">
+    <button id="mic" type="button" class="ghost" title="Ask by microphone">🎤 Speak</button>
     <button id="send" type="submit">Ask</button>
   </form>
 
+  <label id="voiceRow">
+    <input id="voice" type="checkbox" checked>
+    Read answers aloud when the writing finishes
+  </label>
+
   <div id="status"></div>
+  <div id="heard"></div>
   <div id="sources"></div>
   <div id="board"></div>
 
@@ -114,7 +144,10 @@ const CLAUSE_MS = 120;
 const form    = document.getElementById("ask");
 const input   = document.getElementById("question");
 const send    = document.getElementById("send");
+const mic     = document.getElementById("mic");
+const voice   = document.getElementById("voice");
 const status  = document.getElementById("status");
+const heard   = document.getElementById("heard");
 const sources = document.getElementById("sources");
 const board   = document.getElementById("board");
 
@@ -208,7 +241,7 @@ function delayAfter(word) {
   return WORD_MS;
 }
 
-function write(text) {
+function write(text, onDone) {
   const mine = ++run;
   const queue = layout(text);
   const caret = document.createElement("span");
@@ -217,7 +250,11 @@ function write(text) {
   let i = 0;
   (function step() {
     if (mine !== run) return;                 // a newer question took over
-    if (i >= queue.length) { caret.remove(); return; }
+    if (i >= queue.length) {
+      caret.remove();
+      if (onDone) onDone();                   // speech waits for the writing
+      return;
+    }
 
     const { span, word } = queue[i++];
     span.textContent += word;
@@ -236,16 +273,33 @@ function showError(message) {
   board.appendChild(p);
 }
 
-form.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const question = input.value.trim();
-  if (!question) return;
+function setBusy(busy) {
+  send.disabled = input.disabled = mic.disabled = busy;
+}
 
+/* Voice output. The server owns it, so speak.py stays the only place that knows
+   how an answer should sound — the markdown stripping and the maths-into-words
+   rules are not duplicated here. It returns immediately and speaks on a
+   background thread, so this fetch doesn't wait out the audio. */
+async function speakAnswer(text) {
+  try {
+    await fetch("/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+  } catch (err) {
+    status.textContent = "(couldn't start speech: " + err + ")";
+  }
+}
+
+async function ask(question, heardText) {
   ++run;                                      // abandon any current writing
   board.textContent = "";
   sources.textContent = "";
+  heard.textContent = heardText ? `heard: "${heardText}"` : "";
   status.textContent = "Retrieving from your material and teaching…";
-  send.disabled = input.disabled = true;
+  setBusy(true);
 
   try {
     const response = await fetch("/ask", {
@@ -254,25 +308,140 @@ form.addEventListener("submit", async (event) => {
       body: JSON.stringify({ question }),
     });
     const data = await response.json();
+    status.textContent = "";
 
     if (data.error) {
-      status.textContent = "";
       showError(data.error);
-    } else {
-      status.textContent = "";
-      sources.textContent = "sources: " + data.sources
-        .map((s) => `page ${s.page} (${Number(s.distance).toFixed(3)})`)
-        .join(", ");
-      write(data.answer);
+      return;
     }
+
+    sources.textContent = "sources: " + data.sources
+      .map((s) => `page ${s.page} (${Number(s.distance).toFixed(3)})`)
+      .join(", ");
+
+    // Speech starts only once the last word is on the board.
+    write(data.answer, () => {
+      if (voice.checked) speakAnswer(data.answer);
+    });
   } catch (err) {
     status.textContent = "";
     showError("Could not reach the board server — is it still running? " + err);
   } finally {
-    send.disabled = input.disabled = false;
+    setBusy(false);
     input.focus();
     input.select();
   }
+}
+
+form.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const question = input.value.trim();
+  if (question) ask(question);
+});
+
+/* ---- voice input ----------------------------------------------------------
+   listen.py's own recorder can't serve a browser: record_until_enter() blocks
+   on Enter from the server's stdin, and a web page has no way to press it. So
+   the page records here with MediaRecorder and posts the audio, while the
+   server reuses listen.transcribe() untouched — same model, same settings as
+   the terminal. Chrome and Firefox produce opus-in-webm, Safari aac-in-mp4;
+   PyAV on the server decodes either.
+
+   getUserMedia needs a secure context, and browsers count 127.0.0.1 as one, so
+   this works over plain http here — it would not over http on a LAN address. */
+const MIMES = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"];
+
+let recorder = null;
+let chunks = [];
+
+function pickMime() {
+  if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return null;
+  return MIMES.find((m) => MediaRecorder.isTypeSupported(m)) || null;
+}
+
+function resetMic() {
+  mic.classList.remove("recording");
+  mic.textContent = "🎤 Speak";
+  recorder = null;
+}
+
+async function sendRecording(blob) {
+  status.textContent = "Transcribing…";
+  setBusy(true);
+  try {
+    const response = await fetch("/listen", {
+      method: "POST",
+      headers: { "Content-Type": blob.type || "audio/webm" },
+      body: blob,
+    });
+    const data = await response.json();
+    setBusy(false);
+
+    if (data.error) {
+      status.textContent = data.error + " Type the question instead.";
+      return;
+    }
+    input.value = data.text;
+    ask(data.text, data.text);                // heard text stays on screen
+  } catch (err) {
+    setBusy(false);
+    status.textContent = "Transcription failed (" + err + "). Type instead.";
+  }
+}
+
+async function startRecording() {
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    status.textContent = "This browser can't record audio — type the question instead.";
+    return;
+  }
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (err) {
+    status.textContent = "Microphone unavailable (" + err.name +
+      "). Allow access in the browser prompt, or type the question instead.";
+    return;
+  }
+
+  const mime = pickMime();
+  try {
+    recorder = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+  } catch (err) {
+    stream.getTracks().forEach((t) => t.stop());
+    status.textContent = "Can't record in this browser (" + err.name + "). Type instead.";
+    return;
+  }
+
+  chunks = [];
+  recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+  recorder.onerror = () => {
+    stream.getTracks().forEach((t) => t.stop());
+    resetMic();
+    status.textContent = "Recording failed. Type the question instead.";
+  };
+  recorder.onstop = () => {
+    stream.getTracks().forEach((t) => t.stop());
+    const type = (chunks[0] && chunks[0].type) || mime || "audio/webm";
+    const blob = new Blob(chunks, { type });
+    resetMic();
+
+    if (!blob.size) {
+      status.textContent = "Nothing was recorded — type the question instead.";
+      return;
+    }
+    sendRecording(blob);
+  };
+
+  recorder.start();
+  mic.classList.add("recording");
+  mic.textContent = "◼ Stop";
+  status.textContent = "Recording — click Stop when you've finished speaking.";
+}
+
+mic.addEventListener("click", () => {
+  if (recorder && recorder.state === "recording") recorder.stop();
+  else startRecording();
 });
 </script>
 </body>
