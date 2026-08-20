@@ -7,3 +7,10 @@ chromadb==1.5.9
 # to teach.py rather than a dependency change.
 google-genai==2.18.1
 anthropic==0.122.0
+
+# Voice input (listen.py). Speech output needs nothing — speak.py drives the
+# operating system's own text-to-speech. sounddevice's wheel bundles PortAudio,
+# so neither of these needs Homebrew. faster-whisper downloads ~464 MB of model
+# on first use (the "small" one, chosen for accuracy) and then runs offline.
+sounddevice==0.5.6
+faster-whisper==1.2.1

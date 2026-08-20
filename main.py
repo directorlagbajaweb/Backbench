@@ -26,13 +26,15 @@ import sys
 
 from chunk import chunk_pages, slugify_source
 from ingest import extract_text_from_pdf
+from listen import listen
 from speak import speak
 from store import search_chunks, store_chunks
 from teach import generate_answer
 
 N_RESULTS = 3
 EXIT_WORDS = {"quit", "exit", "q"}
-PROMPT = "\nAsk a question (or 'quit'): "
+VOICE_WORDS = {"v", "voice"}
+PROMPT = "\nAsk a question — type it, or 'v' to speak it ('quit' to stop): "
 RULE = "=" * 70
 
 
@@ -82,6 +84,17 @@ def run_question_loop() -> None:
                 continue
             if question.lower() in EXIT_WORDS:
                 break
+
+            # Purely additive: the typed path above is untouched, and this only
+            # runs when you ask for it. listen() returns None for every kind of
+            # failure, and the continue sends you straight back to the prompt to
+            # type instead — voice never blocks a question from being asked.
+            if question.lower() in VOICE_WORDS:
+                spoken = listen()
+                if spoken is None:
+                    continue
+                print(f'heard: "{spoken}"')
+                question = spoken
 
             results = search_chunks(question, n_results=N_RESULTS)
             if not results:
