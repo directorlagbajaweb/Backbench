@@ -2,9 +2,14 @@ PyMuPDF==1.28.2
 python-dotenv==1.2.3
 chromadb==1.5.9
 
-# Teaching step. Gemini is what teach.py currently calls (free tier, no billing
-# needed); anthropic is kept pinned so switching back to Claude is just an edit
-# to teach.py rather than a dependency change.
+# Teaching step. teach.py currently calls OpenRouter, which is OpenAI-compatible
+# JSON over plain HTTP — one POST, so httpx does it and no provider SDK is
+# needed. httpx was already here as a transitive dependency; it's pinned
+# explicitly now that teach.py imports it directly.
+#
+# google-genai and anthropic stay pinned so teach.py can be switched back to
+# Gemini or Claude, or compared against them, without reinstalling anything.
+httpx==0.28.1
 google-genai==2.18.1
 anthropic==0.122.0
 

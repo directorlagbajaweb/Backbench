@@ -4,14 +4,21 @@ Step 3 of Backbench's RAG core: teach from the retrieved chunks, and only those.
 Usage:
     python teach.py "what research design did the study use?"
 
-This needs a Gemini API key. Add GEMINI_API_KEY to your .env file.
+This needs an OpenRouter API key. Add OPENROUTER_API_KEY to your .env file.
 
-Provider note: this runs on Google's Gemini API rather than Claude for now,
-because Gemini's free tier works without billing set up. Everything provider-
-specific is deliberately confined to three places — MODEL, get_client(), and the
+Provider note: this runs on OpenRouter, which fronts many providers behind one
+OpenAI-compatible endpoint. It replaced Gemini because Gemini's free tier allows
+only 20 requests per day per model, which is spent within an afternoon of
+testing. Before that it ran on Claude. Everything provider-specific stays
+confined to the same three places it always has — MODEL, get_client(), and the
 request/response handling inside generate_answer(). The system prompt, the chunk
-formatting, the CLI, and generate_answer's signature are all provider-agnostic,
-so switching back to Claude means editing those three spots and nothing else.
+and history formatting, the CLI, and generate_answer's signature are all
+provider-agnostic, and anthropic and google-genai stay pinned in
+requirements.txt, so switching back or comparing is an edit to those three spots.
+
+No SDK for this one. OpenRouter speaks OpenAI-compatible JSON over plain HTTP,
+which is one POST — so this uses httpx, already present, rather than adding the
+openai package for a single call.
 
 The whole job here is grounding: take a question plus the chunks store.py
 retrieved for it, and produce an answer that teaches from those chunks and
@@ -33,46 +40,48 @@ this into main.py's loop.
 """
 
 import os
+import re
 import sys
 
+import httpx
 from dotenv import load_dotenv
-from google import genai
-from google.genai import errors, types
 
 from store import search_chunks
 
-# Free tier, which allows 20 requests per day per model. That quota is easy to
-# exhaust while testing, and it's counted separately for each model — so this is
-# the knob to turn when today's allowance runs out.
+# Picked from OpenRouter's live model list (their /api/v1/models endpoint), taking
+# only entries whose prompt *and* completion price are both zero — 20 of 417
+# models at the time of writing.
 #
-# Chosen on measured reliability rather than capability. Over four calls each,
-# this one answered 3 times while gemini-3.7-flash managed 1, the rest failing
-# with 503 "high demand" — 3.7 is the more capable model and worth switching to
-# when it's responsive, but it was heavily overloaded when this was measured.
-# gemini-3.5-flash was reliable too, so it's the other fallback.
+# This one is the frontier-reasoning option among them: a 550B mixture-of-experts
+# with 55B active and a 1M-token context. The choice is deliberate rather than
+# first-on-the-list, because this prompt leans hard on judgement — deciding
+# whether retrieved excerpts genuinely answer the question, declining when they
+# don't, and spotting arithmetic that contradicts itself. Small fast models tend
+# to be agreeable instead of disciplined about exactly that.
 #
-# A 503 isn't fatal: main.py's loop prints it and keeps the session open, so
-# retyping the question is usually enough.
+# Documented alternatives, all free:
+#   z-ai/glm-5.2:free                      reasoning-focused, 256K, likely faster
+#   nvidia/nemotron-3-super-120b-a12b:free 120B/12B active, efficiency-minded
+#   google/gemma-4-31b-it:free             31B dense, instruction-tuned
 #
-# Note gemini-2.5-flash 404s — it isn't served on this API version, despite
-# appearing in Google's pricing tables.
-MODEL = "gemini-3.6-flash"
+# Deliberately NOT openrouter/free: it picks a free model at random per request,
+# so grounding behaviour would vary run to run and a carefully tuned prompt could
+# not be held responsible for the output.
+MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
 TEMPERATURE = 0.2  # grounded teaching, not creative writing — keep it close to the source
+MAX_TOKENS = 2000
+TIMEOUT_SECONDS = 180  # free-tier reasoning models can be slow to start
 N_RESULTS = 3
 RULE = "=" * 70
 
-# Ways the model can stop that mean "there is no usable answer here", as opposed
-# to simply running long. Checked explicitly because every one of them arrives as
-# a perfectly successful HTTP response.
-BLOCKED_FINISH_REASONS = frozenset(
-    {
-        types.FinishReason.SAFETY,
-        types.FinishReason.PROHIBITED_CONTENT,
-        types.FinishReason.BLOCKLIST,
-        types.FinishReason.SPII,
-        types.FinishReason.RECITATION,
-    }
-)
+# finish_reason values that mean "no usable answer", as opposed to simply running
+# long. Checked explicitly because they arrive as a perfectly successful HTTP 200.
+BLOCKED_FINISH_REASONS = frozenset({"content_filter", "error"})
+
+# Reasoning models on OpenRouter sometimes leak their scratchpad into the answer
+# as <think>…</think>. Left in, it would be printed on the board and read aloud.
+THINK_TAGS = re.compile(r"<(think|thinking|reasoning)>.*?</\1>", re.S | re.I)
 
 SYSTEM_PROMPT = """\
 You are Backbench, a teaching bot that helps a student learn from their own \
@@ -133,6 +142,25 @@ Write mathematics as plain text: no LaTeX, no $ delimiters, no \\frac{}{}. Use /
 for division and ^ for exponents — the student reads your answers in a terminal, \
 where LaTeX markup is unreadable noise.
 
+# Follow-up questions
+
+The user's message may open with earlier questions and answers from this \
+conversation. That history is there for one purpose: working out what a short \
+follow-up actually means. "Why?" after an answer about sampling means "why was \
+that sampling method chosen?", and "can you explain that more?" refers to what \
+you just explained, not to the words in isolation.
+
+Use it for that and nothing else. It is not a source of facts. The excerpts are \
+still the only material you may teach from, and something you asserted earlier \
+does not become citable just because you were the one who said it. You may refer \
+back to what you already told them — recalling your own explanation is not the \
+same as inventing material — but any fact you add must come from the excerpts in \
+front of you now.
+
+So if the excerpts don't support the follow-up, say so plainly, exactly as you \
+would for a fresh question. A follow-up is not a licence to keep talking past \
+where the material runs out.
+
 # Catch mistakes in the material
 
 Course material is sometimes wrong, and teaching an error as fact is worse than \
@@ -151,26 +179,67 @@ just because it's outside what the excerpts establish.\
 _client = None
 
 
+def extract_error(response) -> str:
+    """
+    Pull a readable message out of a failed response.
+
+    OpenRouter normally returns {"error": {"message": ...}}, but a proxy or a
+    gateway in front of it may return HTML. Falls back to a trimmed body rather
+    than dumping a whole error page into the terminal.
+    """
+    try:
+        body = response.json()
+        if isinstance(body.get("error"), dict):
+            return str(body["error"].get("message") or body["error"])
+        return str(body)[:300]
+    except ValueError:
+        return (response.text or "").strip()[:300] or "no detail returned"
+
+
+class OpenRouterError(Exception):
+    """
+    An API failure, carrying .code and .message.
+
+    Those two attribute names are not arbitrary. main.py and board_server.py
+    already read them by duck-typing rather than importing any provider's
+    exception classes, so raising this keeps both callers working with no edit —
+    the same reason the Gemini errors it replaces needed none.
+    """
+
+    def __init__(self, code: int | None, message: str):
+        self.code = code
+        self.message = message
+        super().__init__(f"{code}: {message}" if code else message)
+
+
 def get_client():
     """
-    Build (once) the Gemini client, loading the key from .env.
+    Build (once) the HTTP client for OpenRouter, loading the key from .env.
 
     Raises RuntimeError with a fix-it message if no key is configured — that's
-    the most likely first-run failure, and a bare 400 from deep inside the SDK
-    doesn't tell you which variable to go and set.
+    the most likely first-run failure, and a bare 401 doesn't tell you which
+    variable to go and set.
     """
     global _client
 
     if _client is None:
         load_dotenv()
-        api_key = os.getenv("GEMINI_API_KEY")
+        api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
             raise RuntimeError(
-                "No GEMINI_API_KEY found. Add this line to your .env file:\n"
-                "    GEMINI_API_KEY=your_key_here\n"
-                "Free keys come from https://aistudio.google.com/apikey"
+                "No OPENROUTER_API_KEY found. Add this line to your .env file:\n"
+                "    OPENROUTER_API_KEY=sk-or-v1-your_key_here\n"
+                "Free keys come from https://openrouter.ai/keys"
             )
-        _client = genai.Client(api_key=api_key)
+        _client = httpx.Client(
+            timeout=TIMEOUT_SECONDS,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                # Optional attribution headers OpenRouter uses to label traffic.
+                "X-Title": "Backbench",
+            },
+        )
 
     return _client
 
@@ -200,38 +269,83 @@ def format_chunks(chunks: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
-def build_user_message(question: str, chunks: list[dict]) -> str:
+def format_history(history: list[dict]) -> str:
     """
-    Assemble the single user turn: the excerpts, then the question.
+    Lay out earlier exchanges so a short follow-up can be understood.
 
     Returns a string like:
+        Earlier in this conversation:
+
+        Student asked: What research design did the study use?
+        You answered: This study used a descriptive survey design...
+
+    Labelled as conversation rather than as material, deliberately: the system
+    prompt tells the model these are not citable facts, and the wording here
+    shouldn't undercut that by making them look like more excerpts.
+    """
+    turns = []
+
+    for exchange in history:
+        turns.append(
+            f"Student asked: {exchange.get('question', '')}\n"
+            f"You answered: {exchange.get('answer', '')}"
+        )
+
+    return "Earlier in this conversation:\n\n" + "\n\n".join(turns)
+
+
+def build_user_message(question: str, chunks: list[dict],
+                       history: list[dict] | None = None) -> str:
+    """
+    Assemble the single user turn: any history, then the excerpts, then the question.
+
+    Returns a string like:
+        Earlier in this conversation:
+        Student asked: ...
+        You answered: ...
+        ---
         Excerpts retrieved from the student's course material:
         [Excerpt 1] page 4 — distance 0.731 (lower is closer)
-        ...
         ---
-        The student's question: What research design did the study use?
+        The student's question: why?
 
     The question goes last so it reads as the thing being asked *about* the
     material above it, rather than getting lost in front of a wall of excerpts.
+    History goes first, as background, so the excerpts stay next to the question
+    they're supposed to answer.
     """
-    return (
+    parts = []
+
+    if history:
+        parts.append(format_history(history))
+
+    parts.append(
         "Excerpts retrieved from the student's course material:\n\n"
-        f"{format_chunks(chunks)}\n\n"
-        "---\n\n"
-        f"The student's question: {question}"
+        f"{format_chunks(chunks)}"
     )
+    parts.append(f"The student's question: {question}")
+
+    return "\n\n---\n\n".join(parts)
 
 
-def generate_answer(question: str, chunks: list[dict]) -> str:
+def generate_answer(question: str, chunks: list[dict],
+                    history: list[dict] | None = None) -> str:
     """
     Ask the model to teach the answer to one question from one set of chunks.
 
-    Takes the question and the chunks that search_chunks() returned for it, and
-    gives back the answer as plain text.
+    Takes the question, the chunks that search_chunks() returned for it, and
+    optionally the recent exchanges of this conversation as
+    [{"question": ..., "answer": ...}, ...] — oldest first. Gives back the answer
+    as plain text.
 
-    No conversation history: each question is answered from its own excerpts, so
-    the answer can never lean on something established in an earlier turn that
-    the current excerpts don't support.
+    History is passed so short follow-ups can be understood, not so they can be
+    answered from it: the excerpts remain the only source of facts, and the
+    system prompt says so explicitly. Callers that want no memory — the board
+    server, for one — simply leave it out and get the old behaviour.
+
+    Note the split of responsibilities: the history lives with the caller, so
+    this stays a pure function of what it's handed and nothing here accumulates
+    state between questions.
     """
     if not chunks:
         return (
@@ -239,50 +353,60 @@ def generate_answer(question: str, chunks: list[dict]) -> str:
             "nothing for me to teach from. Is anything actually stored?"
         )
 
-    response = get_client().models.generate_content(
-        model=MODEL,
-        contents=build_user_message(question, chunks),
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=TEMPERATURE,
-            # No tools here, so automatic function calling has nothing to do —
-            # left on, the SDK logs a warning about it on every single run.
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                disable=True
-            ),
-        ),
-    )
+    # The system prompt is a separate message here rather than a dedicated
+    # parameter, which is the only structural difference from the Gemini call.
+    # Its text is untouched.
+    payload = {
+        "model": MODEL,
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": build_user_message(question, chunks, history)},
+        ],
+    }
 
-    # Gemini can decline in two separate places, and both come back as a
-    # successful response rather than an error: it can block the prompt before
-    # generating anything, or stop partway through its own answer. This material
-    # is a cybersecurity paper, so the safety filters are a live possibility
-    # rather than a theoretical one.
-    block_reason = getattr(response.prompt_feedback, "block_reason", None)
-    if block_reason:
-        return (
-            f"Gemini blocked the question before answering ({block_reason}). "
-            "Its safety filters flagged the request — try rephrasing it."
-        )
+    try:
+        response = get_client().post(API_URL, json=payload)
+    except httpx.TimeoutException:
+        raise OpenRouterError(None, f"No response within {TIMEOUT_SECONDS}s. "
+                                    f"Free models can be slow — try again.")
+    except httpx.HTTPError as error:
+        raise OpenRouterError(None, f"Couldn't reach OpenRouter: {error}")
 
-    if not response.candidates:
-        return "Gemini returned no answer at all, which shouldn't happen."
+    if response.status_code != 200:
+        raise OpenRouterError(response.status_code, extract_error(response))
 
-    finish_reason = response.candidates[0].finish_reason
+    try:
+        body = response.json()
+    except ValueError:
+        raise OpenRouterError(None, "OpenRouter returned something that wasn't JSON.")
+
+    # OpenRouter can also report failure inside a 200 body.
+    if isinstance(body.get("error"), dict):
+        raise OpenRouterError(body["error"].get("code"),
+                              str(body["error"].get("message", "Unknown error")))
+
+    choices = body.get("choices") or []
+    if not choices:
+        return "OpenRouter returned no answer at all, which shouldn't happen."
+
+    choice = choices[0]
+    finish_reason = choice.get("finish_reason")
+
     if finish_reason in BLOCKED_FINISH_REASONS:
         return (
-            f"Gemini stopped partway through its answer ({finish_reason.value}). "
-            "Its safety filters flagged the material or the answer — try "
+            f"The model stopped without answering ({finish_reason}). "
+            "A content filter flagged the material or the answer — try "
             "rephrasing the question."
         )
 
-    # .text is None when the response holds no text parts at all.
-    answer = (response.text or "").strip()
+    answer = THINK_TAGS.sub("", choice.get("message", {}).get("content") or "").strip()
 
-    if finish_reason == types.FinishReason.MAX_TOKENS:
-        answer += "\n\n[Answer was cut off at the model's output limit.]"
+    if finish_reason == "length":
+        answer += f"\n\n[Answer was cut off at the {MAX_TOKENS}-token limit.]"
 
-    return answer or "Gemini returned an empty answer, which shouldn't happen."
+    return answer or "OpenRouter returned an empty answer, which shouldn't happen."
 
 
 def main():
@@ -313,28 +437,27 @@ def main():
     except RuntimeError as error:
         print(error)
         sys.exit(1)
-    except errors.ClientError as error:
+    except OpenRouterError as error:
         if error.code == 429:
-            # Two different limits both arrive as a 429: a short per-minute rate
-            # limit, and the free tier's 20-requests-per-day-per-model quota. The
-            # API's own message says which one was hit and how long to wait, so
-            # pass it straight through rather than guessing at it.
+            # Free models are rate limited per model and per account. The API's
+            # own message says which limit was hit, so pass it through rather
+            # than guessing.
             print(f"Rate limited: {error.message}")
-            print("The free tier allows 20 requests per day per model, counted")
-            print(f"separately for each — so changing MODEL (currently {MODEL})")
-            print("buys a fresh allowance when today's is spent.")
-        elif error.code in (400, 403):
-            print(f"Gemini rejected the request ({error.code}): {error.message}")
-            print("If that mentions the API key, check GEMINI_API_KEY in .env.")
+            print("Free models have their own limits, counted per model — so")
+            print(f"changing MODEL (currently {MODEL}) is the usual fix. The")
+            print("alternatives are listed in the comment above it.")
+        elif error.code in (401, 403):
+            print(f"OpenRouter rejected the key ({error.code}): {error.message}")
+            print("Check OPENROUTER_API_KEY in .env — keys start with 'sk-or-v1-'.")
+        elif error.code == 404:
+            print(f"No such model: {MODEL}")
+            print("Free models come and go. Check https://openrouter.ai/models")
+            print("and pick another, filtering for free.")
+        elif error.code and error.code >= 500:
+            print(f"OpenRouter server error {error.code}: {error.message}")
+            print("Not your fault — try again shortly.")
         else:
-            print(f"Gemini client error {error.code}: {error.message}")
-        sys.exit(1)
-    except errors.ServerError as error:
-        print(f"Gemini server error {error.code}: {error.message}")
-        print("Not your fault — try again shortly.")
-        sys.exit(1)
-    except errors.APIError as error:
-        print(f"Gemini API error: {error}")
+            print(f"OpenRouter error: {error.message}")
         sys.exit(1)
     print(RULE)
 

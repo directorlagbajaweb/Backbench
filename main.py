@@ -32,6 +32,8 @@ from store import search_chunks, store_chunks
 from teach import generate_answer
 
 N_RESULTS = 3
+MAX_HISTORY = 4  # exchanges kept, so a long session can't grow the prompt forever
+FOLLOWUP_MAX_WORDS = 6  # at or below this, a question after an answer reads as a follow-up
 EXIT_WORDS = {"quit", "exit", "q"}
 VOICE_WORDS = {"v", "voice"}
 PROMPT = "\nAsk a question — type it, or 'v' to speak it ('quit' to stop): "
@@ -76,7 +78,14 @@ def run_question_loop() -> None:
     Errors are split by whether waiting helps. A missing API key fails every
     question identically, so there's no point sitting in the loop; a rate limit or
     a server blip is worth staying open for, since the setup cost is already paid.
+
+    Conversation memory lives here, in a plain list, for as long as the process
+    runs. It's deliberately not inside teach.py: generate_answer() stays a pure
+    function of what it's given, and a caller that wants no memory — the board
+    server — just doesn't pass any.
     """
+    history: list[dict] = []
+
     try:
         while True:
             question = input(PROMPT).strip()
@@ -96,7 +105,23 @@ def run_question_loop() -> None:
                 print(f'heard: "{spoken}"')
                 question = spoken
 
-            results = search_chunks(question, n_results=N_RESULTS)
+            # Giving history to generate_answer() lets it understand "why?", but
+            # retrieval still runs on the literal word. Measured: "why?" alone
+            # retrieves at distance 0.976, where a completely unrelated question
+            # scores 0.988 — so the model understood the follow-up and then had
+            # nothing relevant to answer it from. Prepending the previous question
+            # to the *search query* puts it back on the right section: 3 of 3
+            # correct chunks instead of 0 of 3.
+            #
+            # Only the search query is widened. generate_answer() still gets the
+            # bare question, so the model is never told the student asked
+            # something they didn't.
+            search_query = question
+            if history and len(question.split()) <= FOLLOWUP_MAX_WORDS:
+                search_query = f"{history[-1]['question']} {question}"
+                print(f"\n(reading as a follow-up to: {history[-1]['question']})")
+
+            results = search_chunks(search_query, n_results=N_RESULTS)
             if not results:
                 print("\nNothing came back. Is anything actually stored?")
                 continue
@@ -105,7 +130,7 @@ def run_question_loop() -> None:
             print(RULE)
 
             try:
-                answer = generate_answer(question, results)
+                answer = generate_answer(question, results, history=history)
             except RuntimeError as error:
                 # Configuration, not weather — a missing key won't fix itself.
                 print(error)
@@ -131,6 +156,15 @@ def run_question_loop() -> None:
 
             print(answer)
             print(RULE)
+
+            # Remember this exchange so the next question can be a follow-up.
+            # Only successful answers go in — an error message is not something
+            # the next turn should try to interpret "why?" against. Trimmed to the
+            # last few exchanges so a long session doesn't grow the prompt without
+            # limit. Typed and spoken questions land here identically, because by
+            # this point both are just `question`.
+            history.append({"question": question, "answer": answer})
+            del history[:-MAX_HISTORY]
 
             # Printing comes first and speaking second, so the answer is on
             # screen whatever happens to the audio. speak() swallows its own
