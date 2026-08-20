@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backbench — live board</title>
+<style>
+  :root {
+    --board: #16211f;
+    --board-edge: #0d1413;
+    --chalk: #eef4f1;
+    --chalk-dim: #8fa8a0;
+    --accent: #7fd1b9;
+    --frame: #2b3a37;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: #0b1110;
+    color: var(--chalk);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: 32px 20px 56px;
+  }
+  main { width: 100%; max-width: 820px; }
+  h1 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--chalk-dim);
+    margin: 0 0 18px;
+  }
+  form { display: flex; gap: 10px; margin-bottom: 18px; }
+  input[type=text] {
+    flex: 1;
+    padding: 12px 14px;
+    font-size: 1rem;
+    color: var(--chalk);
+    background: #101a19;
+    border: 1px solid var(--frame);
+    border-radius: 8px;
+  }
+  input[type=text]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button {
+    padding: 12px 20px;
+    font-size: 1rem;
+    font-weight: 600;
+    color: #06100e;
+    background: var(--accent);
+    border: 0;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { min-height: 1.4em; margin-bottom: 10px; color: var(--chalk-dim); font-size: .9rem; }
+  #sources { margin-bottom: 10px; color: var(--chalk-dim); font-size: .82rem; font-variant-numeric: tabular-nums; }
+  #board {
+    background: var(--board);
+    border: 1px solid var(--frame);
+    border-top: 3px solid var(--board-edge);
+    border-radius: 10px;
+    padding: 26px 30px;
+    min-height: 320px;
+    box-shadow: inset 0 1px 0 #ffffff0d;
+  }
+  #board p, #board ul, #board h3 { margin: 0 0 .85em; }
+  #board h3 { font-size: 1rem; color: var(--accent); letter-spacing: .02em; }
+  #board ul { padding-left: 1.15em; }
+  #board li { margin-bottom: .4em; }
+  #board strong { color: #fff; font-weight: 650; }
+  #board .err { color: #ffb4a2; }
+  .caret {
+    display: inline-block;
+    width: .5em; height: 1.05em;
+    margin-left: 1px;
+    vertical-align: -.18em;
+    background: var(--accent);
+    animation: blink .9s step-end infinite;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+  .hint { margin-top: 14px; color: var(--chalk-dim); font-size: .8rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Backbench · live board</h1>
+
+  <form id="ask">
+    <input id="question" type="text" autocomplete="off" autofocus
+           placeholder="Ask a question about your material…">
+    <button id="send" type="submit">Ask</button>
+  </form>
+
+  <div id="status"></div>
+  <div id="sources"></div>
+  <div id="board"></div>
+
+  <p class="hint">
+    The answer is written out word by word. Typed questions only for this step —
+    voice input and speech sync come later.
+  </p>
+</main>
+
+<script>
+// Milliseconds between words, plus a longer beat after sentence-ending
+// punctuation so it reads like someone writing rather than a metronome.
+const WORD_MS = 42;
+const SENTENCE_MS = 260;
+const CLAUSE_MS = 120;
+
+const form    = document.getElementById("ask");
+const input   = document.getElementById("question");
+const send    = document.getElementById("send");
+const status  = document.getElementById("status");
+const sources = document.getElementById("sources");
+const board   = document.getElementById("board");
+
+// Bumped on every new question so a still-running animation stops writing
+// into a board that has already moved on.
+let run = 0;
+
+/* Split the answer into blocks: headings, bullets and paragraphs. Consecutive
+   plain lines join into one paragraph, the way markdown reads them. */
+function toBlocks(text) {
+  const blocks = [];
+  for (const raw of text.replace(/```[\w-]*/g, "").replace(/`/g, "").split("\n")) {
+    const line = raw.trim();
+    if (!line) { blocks.push(null); continue; }              // paragraph break
+
+    const heading = line.match(/^#{1,6}\s+(.*)$/);
+    if (heading) { blocks.push({ kind: "h", text: heading[1] }); continue; }
+
+    const bullet = line.match(/^[-*+]\s+(.*)$/);
+    if (bullet) { blocks.push({ kind: "li", text: bullet[1] }); continue; }
+
+    const last = blocks[blocks.length - 1];
+    if (last && last.kind === "p") last.text += " " + line;
+    else blocks.push({ kind: "p", text: line });
+  }
+  // The nulls did their job during the loop above — they stop two plain lines
+  // separated by a blank one from merging into a single paragraph. They must not
+  // survive into layout(), which expects every block to be real.
+  return blocks.filter((block) => block !== null);
+}
+
+/* Split one line into bold and plain runs. Model output uses **bold** heavily,
+   and asterisks left on a board look like a bug. */
+function toRuns(text) {
+  const runs = [];
+  const pattern = /\*\*([^*]+)\*\*/g;
+  let at = 0, m;
+  while ((m = pattern.exec(text)) !== null) {
+    if (m.index > at) runs.push({ bold: false, text: text.slice(at, m.index) });
+    runs.push({ bold: true, text: m[1] });
+    at = m.index + m[0].length;
+  }
+  if (at < text.length) runs.push({ bold: false, text: text.slice(at) });
+  return runs.length ? runs : [{ bold: false, text: text }];
+}
+
+/* Build the empty shape of the answer, and a flat queue of words to pour into
+   it. Formatting exists before any word appears, so nothing reflows mid-write.
+   Model text only ever reaches the page through textContent — never innerHTML —
+   so an answer containing markup cannot become markup. */
+function layout(text) {
+  board.textContent = "";
+  const queue = [];
+  let list = null;
+
+  for (const block of toBlocks(text)) {
+    let host;
+    if (block.kind === "li") {
+      if (!list) { list = document.createElement("ul"); board.appendChild(list); }
+      host = document.createElement("li");
+      list.appendChild(host);
+    } else {
+      list = null;
+      host = document.createElement(block.kind === "h" ? "h3" : "p");
+      board.appendChild(host);
+    }
+
+    for (const piece of toRuns(block.text)) {
+      const span = document.createElement(piece.bold ? "strong" : "span");
+      host.appendChild(span);
+
+      // Each token carries its own leading AND trailing whitespace. Matching
+      // only /\S+\s*/ would swallow the leading space, so the run after a bold
+      // one would butt straight against it — "**15%** of" rendering as "15%of".
+      const tokens = piece.text.match(/\s*\S+\s*/g);
+      if (tokens) {
+        for (const word of tokens) queue.push({ span, word });
+      } else if (piece.text) {
+        // A run of pure whitespace, e.g. the gap in "**a** **b**". No word to
+        // match, but dropping it would join the two neighbours together.
+        queue.push({ span, word: piece.text });
+      }
+    }
+  }
+  return queue;
+}
+
+function delayAfter(word) {
+  if (/[.!?]["')\]]?\s*$/.test(word)) return SENTENCE_MS;
+  if (/[,;:—]\s*$/.test(word)) return CLAUSE_MS;
+  return WORD_MS;
+}
+
+function write(text) {
+  const mine = ++run;
+  const queue = layout(text);
+  const caret = document.createElement("span");
+  caret.className = "caret";
+
+  let i = 0;
+  (function step() {
+    if (mine !== run) return;                 // a newer question took over
+    if (i >= queue.length) { caret.remove(); return; }
+
+    const { span, word } = queue[i++];
+    span.textContent += word;
+    span.parentNode.appendChild(caret);       // caret follows the writing
+    window.scrollTo(0, document.body.scrollHeight);
+    setTimeout(step, delayAfter(word));
+  })();
+}
+
+function showError(message) {
+  ++run;                                      // stop any animation in flight
+  board.textContent = "";
+  const p = document.createElement("p");
+  p.className = "err";
+  p.textContent = message;
+  board.appendChild(p);
+}
+
+form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const question = input.value.trim();
+  if (!question) return;
+
+  ++run;                                      // abandon any current writing
+  board.textContent = "";
+  sources.textContent = "";
+  status.textContent = "Retrieving from your material and teaching…";
+  send.disabled = input.disabled = true;
+
+  try {
+    const response = await fetch("/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    const data = await response.json();
+
+    if (data.error) {
+      status.textContent = "";
+      showError(data.error);
+    } else {
+      status.textContent = "";
+      sources.textContent = "sources: " + data.sources
+        .map((s) => `page ${s.page} (${Number(s.distance).toFixed(3)})`)
+        .join(", ");
+      write(data.answer);
+    }
+  } catch (err) {
+    status.textContent = "";
+    showError("Could not reach the board server — is it still running? " + err);
+  } finally {
+    send.disabled = input.disabled = false;
+    input.focus();
+    input.select();
+  }
+});
+</script>
+</body>
+</html>
