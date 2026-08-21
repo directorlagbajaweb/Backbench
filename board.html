@@ -33,7 +33,62 @@
     color: var(--chalk-dim);
     margin: 0 0 18px;
   }
-  form { display: flex; gap: 10px; margin-bottom: 18px; }
+
+  /* Panels give the upload area, the ask row and the board a shared frame, so
+     they read as one interface rather than three stacked widgets. */
+  .panel {
+    background: #101a19;
+    border: 1px solid var(--frame);
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 14px;
+  }
+  .panel h2 {
+    margin: 0 0 12px;
+    font-size: .72rem;
+    font-weight: 600;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--chalk-dim);
+  }
+
+  /* Upload */
+  #drop {
+    border: 1.5px dashed var(--frame);
+    border-radius: 8px;
+    padding: 22px 18px;
+    text-align: center;
+    color: var(--chalk-dim);
+    font-size: .92rem;
+    transition: border-color .15s, background .15s, color .15s;
+    cursor: pointer;
+  }
+  #drop:hover, #drop.over {
+    border-color: var(--accent);
+    background: #12201e;
+    color: var(--chalk);
+  }
+  #drop.busy { cursor: progress; border-style: solid; }
+  #drop strong { color: var(--accent); font-weight: 600; }
+  #loaded:not(:empty) { margin-top: 12px; font-size: .86rem; }
+  .doc {
+    display: flex; align-items: baseline; gap: 8px;
+    padding: 5px 0; color: var(--chalk);
+    border-top: 1px solid var(--frame);
+  }
+  .doc .tick { color: var(--accent); }
+  .doc .n { margin-left: auto; color: var(--chalk-dim); font-variant-numeric: tabular-nums; }
+  .spinner {
+    display: inline-block; width: .85em; height: .85em;
+    margin-right: 8px; vertical-align: -.1em;
+    border: 2px solid var(--frame); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  form { display: flex; gap: 10px; }
+  fieldset { border: 0; margin: 0; padding: 0; }
+  fieldset:disabled { opacity: .45; }
   input[type=text] {
     flex: 1;
     padding: 12px 14px;
@@ -69,10 +124,14 @@
   @keyframes pulse { 50% { opacity: .6; } }
   #voiceRow {
     display: flex; align-items: center; gap: 8px;
-    margin: -6px 0 14px; color: var(--chalk-dim); font-size: .85rem;
+    margin: 12px 0 0; color: var(--chalk-dim); font-size: .85rem;
     cursor: pointer; user-select: none;
   }
   #status { min-height: 1.4em; margin-bottom: 10px; color: var(--chalk-dim); font-size: .9rem; }
+  #empty {
+    color: var(--chalk-dim); text-align: center; padding: 78px 20px; font-size: .95rem;
+  }
+  #empty span { display: block; margin-top: 6px; font-size: .84rem; opacity: .75; }
   #heard:not(:empty) {
     margin-bottom: 10px; padding: 8px 12px;
     border-left: 3px solid var(--accent);
@@ -111,17 +170,30 @@
 <main>
   <h1>Backbench · live board</h1>
 
-  <form id="ask">
-    <input id="question" type="text" autocomplete="off" autofocus
-           placeholder="Ask a question about your material…">
-    <button id="mic" type="button" class="ghost" title="Ask by microphone">🎤 Speak</button>
-    <button id="send" type="submit">Ask</button>
-  </form>
+  <section class="panel">
+    <h2>Material</h2>
+    <div id="drop" tabindex="0" role="button">
+      <strong>Choose a PDF</strong> or drop one here
+    </div>
+    <input id="file" type="file" accept="application/pdf,.pdf" hidden>
+    <div id="loaded"></div>
+  </section>
 
-  <label id="voiceRow">
-    <input id="voice" type="checkbox" checked>
-    Read answers aloud when the writing finishes
-  </label>
+  <section class="panel">
+    <h2>Ask</h2>
+    <fieldset id="askFields" disabled>
+      <form id="ask">
+        <input id="question" type="text" autocomplete="off"
+               placeholder="Ask a question about your material…">
+        <button id="mic" type="button" class="ghost" title="Ask by microphone">🎤 Speak</button>
+        <button id="send" type="submit">Ask</button>
+      </form>
+      <label id="voiceRow">
+        <input id="voice" type="checkbox" checked>
+        Read answers aloud when the writing finishes
+      </label>
+    </fieldset>
+  </section>
 
   <div id="status"></div>
   <div id="heard"></div>
@@ -129,8 +201,7 @@
   <div id="board"></div>
 
   <p class="hint">
-    The answer is written out word by word. Typed questions only for this step —
-    voice input and speech sync come later.
+    Answers are written out word by word, grounded only in the material above.
   </p>
 </main>
 
@@ -150,6 +221,10 @@ const status  = document.getElementById("status");
 const heard   = document.getElementById("heard");
 const sources = document.getElementById("sources");
 const board   = document.getElementById("board");
+const drop    = document.getElementById("drop");
+const file    = document.getElementById("file");
+const loaded  = document.getElementById("loaded");
+const fields  = document.getElementById("askFields");
 
 // Bumped on every new question so a still-running animation stops writing
 // into a board that has already moved on.
@@ -443,6 +518,146 @@ mic.addEventListener("click", () => {
   if (recorder && recorder.state === "recording") recorder.stop();
   else startRecording();
 });
+
+/* ---- material: upload, and knowing whether anything is loaded ------------- */
+
+function showEmpty() {
+  board.textContent = "";
+  const div = document.createElement("div");
+  div.id = "empty";
+  div.textContent = "Upload a PDF to get started.";
+  const sub = document.createElement("span");
+  sub.textContent = "Once it's chunked and stored, you can ask about it.";
+  div.appendChild(sub);
+  board.appendChild(div);
+}
+
+/* The store lives on disk and outlives the server, so "ready" means "there is
+   material", not "you uploaded something this session". Restarting the server
+   with a populated store leaves the question box working, which is the honest
+   behaviour — pretending otherwise would just make you re-upload. */
+function setReady(ready) {
+  fields.disabled = !ready;
+  if (!ready) showEmpty();
+}
+
+function renderLoaded(info) {
+  loaded.textContent = "";
+  for (const s of info.sources || []) {
+    const row = document.createElement("div");
+    row.className = "doc";
+    const tick = document.createElement("span");
+    tick.className = "tick"; tick.textContent = "✓";
+    const name = document.createElement("span");
+    name.textContent = s.source;
+    const n = document.createElement("span");
+    n.className = "n";
+    n.textContent = `${s.chunks} chunk${s.chunks === 1 ? "" : "s"}`;
+    row.append(tick, name, n);
+    loaded.appendChild(row);
+  }
+}
+
+async function refreshStatus() {
+  try {
+    // Not named `status` — that identifier is already the #status element, and
+    // shadowing it here would be a trap for the next edit.
+    const info = await (await fetch("/status")).json();
+    renderLoaded(info);
+    setReady((info.total || 0) > 0);
+    return info;
+  } catch (err) {
+    setReady(false);
+    status.textContent = "Couldn't reach the board server.";
+    return null;
+  }
+}
+
+/* Chunking and embedding take seconds to a minute, and it all happens inside one
+   request — there's no progress to report without reaching into store.py, which
+   this step doesn't touch. So the state is honest about being indeterminate and
+   counts elapsed seconds, which at least shows it's still working. */
+async function upload(pdf) {
+  if (!pdf) return;
+  if (!/\.pdf$/i.test(pdf.name)) {
+    status.textContent = "That isn't a PDF.";
+    return;
+  }
+
+  const original = drop.innerHTML;
+  drop.classList.add("busy");
+  fields.disabled = true;
+  sources.textContent = "";
+  heard.textContent = "";
+
+  const began = Date.now();
+  const tick = setInterval(() => {
+    const secs = Math.round((Date.now() - began) / 1000);
+    drop.innerHTML = `<span class="spinner"></span>Reading, chunking and ` +
+                     `embedding <strong>${pdf.name}</strong>… ${secs}s`;
+  }, 250);
+  drop.innerHTML = `<span class="spinner"></span>Reading <strong>${pdf.name}</strong>…`;
+
+  try {
+    const response = await fetch("/upload", {
+      method: "POST",
+      headers: { "Content-Type": "application/pdf", "X-Filename": pdf.name },
+      body: pdf,
+    });
+    const data = await response.json();
+    clearInterval(tick);
+    drop.classList.remove("busy");
+    drop.innerHTML = original;
+
+    if (data.error) {
+      status.textContent = data.error;
+      await refreshStatus();          // an earlier document may still be loaded
+      return;
+    }
+
+    const secs = ((Date.now() - began) / 1000).toFixed(1);
+    status.textContent = `Ready: ${data.filename} — ${data.pages} page` +
+      `${data.pages === 1 ? "" : "s"}, ${data.chunks} chunk` +
+      `${data.chunks === 1 ? "" : "s"} stored in ${secs}s.`;
+    await refreshStatus();
+    board.textContent = "";
+    input.focus();
+  } catch (err) {
+    clearInterval(tick);
+    drop.classList.remove("busy");
+    drop.innerHTML = original;
+    status.textContent = "Upload failed: " + err;
+    await refreshStatus();
+  }
+}
+
+drop.addEventListener("click", () => { if (!drop.classList.contains("busy")) file.click(); });
+drop.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); file.click(); }
+});
+file.addEventListener("change", () => {
+  const chosen = file.files && file.files[0];
+  file.value = "";                    // so re-picking the same file still fires
+  upload(chosen);
+});
+
+// Drag and drop, sharing the same handler as the picker. The window-level
+// handlers stop the browser from navigating away to the dropped file.
+for (const name of ["dragenter", "dragover"]) {
+  drop.addEventListener(name, (e) => { e.preventDefault(); drop.classList.add("over"); });
+}
+for (const name of ["dragleave", "dragend"]) {
+  drop.addEventListener(name, () => drop.classList.remove("over"));
+}
+drop.addEventListener("drop", (e) => {
+  e.preventDefault();
+  drop.classList.remove("over");
+  if (!drop.classList.contains("busy")) upload(e.dataTransfer.files[0]);
+});
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => e.preventDefault());
+
+refreshStatus();
 </script>
 </body>
 </html>

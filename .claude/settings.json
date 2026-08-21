@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --check /tmp/b6.js)",
+      "Bash(rm -rf /tmp/boardempty)",
+      "Bash(mkdir -p /tmp/boardempty)",
+      "Bash(/Users/macair/Downloads/backbench/venv/bin/python /Users/macair/Downloads/backbench/board_server.py)",
+      "Bash(curl -s http://127.0.0.1:8000/status)",
+      "Bash(curl -s -X POST -H 'X-Filename: notes.txt' --data-binary 'x' -w \" [%{http_code}]\" http://127.0.0.1:8000/upload)",
+      "Bash(curl -s -X POST -H 'X-Filename: ../../evil.pdf' --data-binary 'x' -w \" [%{http_code}]\" http://127.0.0.1:8000/upload)",
+      "Bash(curl -s -X POST -H 'X-Filename: fake.pdf' --data-binary 'just text' -w \" [%{http_code}]\" http://127.0.0.1:8000/upload)",
+      "Bash(curl -s -X POST -H 'X-Filename: scanned.pdf' --data-binary '@/Users/macair/Downloads/Assessment of Cyber Security Measures for Protecting Business Data.pdf' -w ' [%{http_code}]' http://127.0.0.1:8000/upload)",
+      "Bash(time curl -s -X POST -H 'Content-Type: application/pdf' -H 'X-Filename: seminar work .pdf' --data-binary '@/Users/macair/Downloads/backbench/test_material/seminar work .pdf' http://127.0.0.1:8000/upload)",
+      "Bash(curl -s -X POST -H 'Content-Type: application/json' -d '{\"question\":\"What research design did the study use?\"}' http://127.0.0.1:8000/ask)",
+      "Bash(/Users/macair/Downloads/backbench/venv/bin/python -c ' *)",
+      "Bash(curl -s -X POST -H 'X-Filename: scanned2.pdf' --data-binary '@/Users/macair/Downloads/Assessment of Cyber Security Measures for Protecting Business Data.pdf' http://127.0.0.1:8000/upload)",
+      "Bash(xargs -I{} sh -c 'test {} -eq 0 && echo \"  no — cleaned up\" || echo \"  YES, still there\"')",
+      "Bash(curl -s -X POST -H 'X-Filename: planted_error_test.pdf' --data-binary @/Users/macair/Downloads/backbench/test_material/planted_error_test.pdf http://127.0.0.1:8000/upload)",
+      "Bash(./venv/bin/python -c ' *)"
+    ]
+  }
+}

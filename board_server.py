@@ -31,6 +31,7 @@ it, so it should not be reachable from the network.
 
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -50,6 +51,17 @@ N_RESULTS = 3
 BOARD_PATH = Path(__file__).resolve().parent / "board.html"
 MAX_QUESTION_CHARS = 2000
 MAX_AUDIO_BYTES = 25 * 1024 * 1024
+MAX_PDF_BYTES = 50 * 1024 * 1024
+
+# Status codes that mean "nothing came back in time" rather than "the request was
+# wrong". 524 is Cloudflare's — OpenRouter returns it when a free model stalls
+# under load, with a body of literally "error code: 524", which tells the reader
+# nothing. Worth translating into something actionable.
+TIMEOUT_CODES = frozenset({408, 504, 522, 524})
+
+# Uploads land in the same folder the terminal tools read from, which is already
+# gitignored, so material stays inspectable and nothing binary gets committed.
+UPLOAD_DIR = Path(__file__).resolve().parent / "test_material"
 
 # One thing speaks at a time. The board only asks for speech once its own writing
 # animation has finished, and starting a new question abandons that animation, so
@@ -76,6 +88,90 @@ AUDIO_SUFFIXES = {
 }
 
 
+def ingest_pdf(pdf_path: str) -> dict:
+    """
+    Run one PDF through ingest -> chunk -> store, exactly as main.py's startup does.
+
+    Returns
+        {"filename": "x.pdf", "pages": 8, "chunks": 20, "total": 41}
+    or
+        {"error": "..."}
+
+    This is the single copy of that pipeline in this file: main() calls it for a
+    PDF named on the command line, and the upload endpoint calls it for a file
+    that arrived from the browser. Errors come back as data because the browser
+    needs to display them, and main() can print them just as easily.
+    """
+    try:
+        pages = extract_text_from_pdf(pdf_path)
+    except FileNotFoundError as error:
+        return {"error": str(error)}
+    except Exception as error:
+        return {"error": f"Couldn't read that PDF: {type(error).__name__}: {error}"}
+
+    if not pages:
+        return {"error": "No extractable text found — this PDF looks scanned or "
+                         "image-only, which needs OCR that isn't built yet."}
+
+    chunks = chunk_pages(pages, source=slugify_source(pdf_path))
+    store_chunks(chunks)
+
+    return {
+        "filename": Path(pdf_path).name,
+        "pages": len(pages),
+        "chunks": len(chunks),
+        "total": get_collection().count(),
+    }
+
+
+def collection_status() -> dict:
+    """
+    Report what material is currently stored, per source document.
+
+    Returns
+        {"total": 41, "sources": [{"source": "seminar-work", "chunks": 20}, ...]}
+
+    The board asks for this on load. The store is on disk and outlives the
+    server, so a restart shouldn't pretend nothing is loaded — if there's
+    material, the question box should work straight away.
+    """
+    collection = get_collection()
+    total = collection.count()
+    counts: dict[str, int] = {}
+
+    if total:
+        for metadata in collection.get(include=["metadatas"])["metadatas"]:
+            source = metadata.get("source", "unknown")
+            counts[source] = counts.get(source, 0) + 1
+
+    return {
+        "total": total,
+        "sources": [{"source": s, "chunks": n} for s, n in sorted(counts.items())],
+    }
+
+
+def safe_pdf_name(raw: str) -> str | None:
+    """
+    Turn a browser-supplied filename into something safe to write to disk.
+
+    Returns the cleaned name, or None if it isn't usable.
+
+    The name arrives in a header, which means it arrives from whoever called the
+    endpoint. Strip any directory part, allow only ordinary filename characters,
+    and require a .pdf tail — a path like ../../.ssh/authorized_keys must not be
+    able to choose where this writes.
+    """
+    name = raw.replace("\\", "/").split("/")[-1].strip()
+    name = re.sub(r"[^A-Za-z0-9._ ()-]", "_", name)
+
+    if not name or name.startswith(".") or ".." in name:
+        return None
+    if not name.lower().endswith(".pdf"):
+        return None
+
+    return name
+
+
 def answer_question(question: str) -> dict:
     """
     Retrieve and teach one question, as a JSON-ready dict.
@@ -99,11 +195,34 @@ def answer_question(question: str) -> dict:
         return {"error": str(error)}
     except Exception as error:
         # Duck-typed for the same reason main.py does it: this file stays
-        # provider-agnostic, and plain str() on a Gemini error dumps the whole
+        # provider-agnostic, and plain str() on a provider error can dump a whole
         # JSON payload.
         detail = getattr(error, "message", None) or str(error)
         code = getattr(error, "code", None)
-        return {"error": f"{code + ': ' if code else ''}{detail}"}
+
+        # Format the code, never concatenate it. It arrives as an int from
+        # OpenRouter (524), as a string from some providers, and as None when the
+        # request never reached the API — and `code + ": "` raised TypeError on
+        # the int, which took down the request handler instead of showing an
+        # error on the board. Skipped entirely when there's no usable code, so an
+        # empty one can't leave a stray leading colon either.
+        label = f"{code}: " if str(code if code is not None else "").strip() else ""
+
+        # Compare numerically, since the same 524 can arrive as an int or as a
+        # string depending on the provider — a string would otherwise slip past
+        # the timeout branch and show the useless raw body instead.
+        try:
+            numeric_code = int(code)
+        except (TypeError, ValueError):
+            numeric_code = None
+
+        if numeric_code in TIMEOUT_CODES:
+            # The body for these is usually just "error code: 524", so replace
+            # the detail rather than appending to it.
+            return {"error": f"{label}The model took too long to respond. Free "
+                             f"models stall under load — try again."}
+
+        return {"error": f"{label}{detail}"}
 
     return {
         "answer": answer,
@@ -208,6 +327,10 @@ class BoardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
+        if self.path == "/status":
+            self.send_json(collection_status())
+            return
+
         if self.path in ("/", "/board.html"):
             try:
                 body = BOARD_PATH.read_bytes()
@@ -237,6 +360,10 @@ class BoardHandler(BaseHTTPRequestHandler):
         return self.rfile.read(length)
 
     def do_POST(self) -> None:
+        if self.path == "/upload":
+            self.handle_upload()
+            return
+
         if self.path == "/listen":
             self.handle_listen()
             return
@@ -273,6 +400,60 @@ class BoardHandler(BaseHTTPRequestHandler):
 
         print(f"  asked: {question}")
         self.send_json(answer_question(question[:MAX_QUESTION_CHARS]))
+
+    def handle_upload(self) -> None:
+        """
+        Take a PDF from the browser and put it through the ingest pipeline.
+
+        The file arrives as the raw request body with its name in an X-Filename
+        header, rather than as multipart/form-data. That's not laziness: the
+        stdlib's multipart parser lived in `cgi`, which was removed in Python
+        3.13, so multipart here would mean hand-rolling a parser. A raw body is
+        one line in the browser and needs no parsing at all — the same shape
+        /listen already uses for audio.
+        """
+        name = safe_pdf_name(self.headers.get("X-Filename", ""))
+        if not name:
+            self.send_json({"error": "Send a file whose name ends in .pdf."},
+                           status=400)
+            return
+
+        data = self.read_body(MAX_PDF_BYTES)
+        if not data:
+            self.send_json({"error": "No file received, or it exceeded "
+                                     f"{MAX_PDF_BYTES // (1024 * 1024)} MB."},
+                           status=400)
+            return
+
+        # Check the magic bytes rather than trusting the extension.
+        if not data.startswith(b"%PDF"):
+            self.send_json({"error": f"{name} isn't a PDF — it doesn't start "
+                                     f"with the PDF marker."}, status=400)
+            return
+
+        try:
+            UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            path = UPLOAD_DIR / name
+            path.write_bytes(data)
+        except OSError as error:
+            self.send_json({"error": f"Couldn't save the file: {error}"})
+            return
+
+        print(f"  uploaded: {name} ({len(data) // 1024} KB) -> ingesting")
+        result = ingest_pdf(str(path))
+
+        # A scanned PDF is a real PDF, so it passes the marker check and gets
+        # saved before ingestion discovers there's no text in it. Remove it again
+        # rather than letting test_material silently fill up with files nothing
+        # can read — the original is still wherever it was uploaded from.
+        if "error" in result:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+        print(f"  {result}")
+        self.send_json(result)
 
     def handle_listen(self) -> None:
         """Transcribe an uploaded recording from the browser's microphone."""
@@ -317,26 +498,17 @@ def main():
         sys.exit(1)
 
     if len(sys.argv) == 2:
-        pdf_path = sys.argv[1]
-        try:
-            pages = extract_text_from_pdf(pdf_path)
-        except FileNotFoundError as error:
-            print(error)
+        result = ingest_pdf(sys.argv[1])
+        if "error" in result:
+            print(result["error"])
             sys.exit(1)
-
-        if not pages:
-            print("No extractable text found. This file might be scanned/image-only")
-            print("— it'll need OCR, which isn't built yet.")
-            sys.exit(1)
-
-        chunks = chunk_pages(pages, source=slugify_source(pdf_path))
-        print(f"Read {len(pages)} page(s), split into {len(chunks)} chunk(s).")
-        store_chunks(chunks)
+        print(f"Read {result['pages']} page(s), split into "
+              f"{result['chunks']} chunk(s).")
 
     stored = get_collection().count()
     print(f"Collection holds {stored} chunk(s).")
     if stored == 0:
-        print("Nothing stored yet — pass a PDF path, or run store.py first.")
+        print("Nothing stored yet — upload a PDF in the browser to get started.")
 
     server = ThreadingHTTPServer((HOST, PORT), BoardHandler)
     print(f"\nBoard ready at http://{HOST}:{PORT}   (Ctrl-C to stop)")
